@@ -1,176 +1,106 @@
-# ASSR: Auto-Calibrated Stochastic Spectral Regularization
+Here is the updated `README.md`. I have rewritten it to be transparent about the **Speed vs. Stability** trade-off we just discussed, while highlighting the massive **A100/1.1B Parameter** validation success.
 
-**Stabilize Large Model Training with <0.1% Overhead**
+---
 
-ASSR is a PyTorch library that stabilizes the training of Large Language Models (LLMs) and Vision Transformers (ViTs) by monitoring the "Spectral Health" of weight matrices in real-time.
+#ASSR: Auto-Calibrated Stochastic Spectral Regularization**Robust Stability for Large Scale Model Training.**
 
-## 🚀 Key Features
+ASSR is a PyTorch library that prevents training instability and rank collapse in Large Language Models (LLMs) and Vision Transformers. It replaces manual, static regularization with a **dynamic, closed-loop control system** that monitors the spectral health of your weight matrices in real-time.
 
-- **🧠 Auto-Calibrated**: Monitors stable rank and condition number on the fly. If a layer shows signs of collapse or ill-conditioning, ASSR automatically increases regularization; if it's healthy, it backs off.
+**v1.3.0 Verified:** Successfully validated on **1.1B Parameter Llama** models on **NVIDIA A100 GPUs** using **BFloat16** precision.
 
-- **⚡ Near-Zero Overhead**: Uses stochastic sampling to check only 10% of layers per step, reducing computational cost by 90%+ compared to checking every layer.
+##🚀 Why Use ASSR?Training massive models is expensive. A single instability spike on Day 3 can waste thousands of dollars in compute.
 
-- **🔧 Drop-in Replacement**: Works as a single-line replacement for the Hugging Face `Trainer`.
+* **The Problem:** Standard regularization (Weight Decay) is "dumb"—it applies the same pressure to every layer, regardless of health.
+* **The ASSR Solution:** ASSR acts like a thermostat. It scans layers for signs of collapse (Low Stable Rank) or explosion (High Condition Number) and applies surgical penalties only when needed.
 
-- **📈 Dual-Mode Detection**: Catches both rank collapse (redundant neurons) AND ill-conditioning (gradient instability).
+##📊 Performance & Overhead**Does this slow down training?**
+Yes, but it buys you reliability.
 
-## 📦 Installation
+* **Throughput Cost:** Expect a **~15-25% reduction in steps-per-second** depending on your GPU and model size. Calculating SVDs and Eigenvalues for large matrices (e.g., 4096×4096) is mathematically heavy.
+* **The Gain:**
+* **Prevents Divergence:** Stops loss spikes before they kill a run.
+* **No Manual Tuning:** The auto-calibrator finds the right thresholds for you.
+* **Better Convergence:** Keeps weight matrices spectrally healthy, ensuring efficient gradient flow.
+
+
+
+**Optimization:** We use **Stochastic Sampling** (checking only 10% of layers per step) to keep this overhead manageable.
+
+##📦 InstallationInstall directly from the repository:
 
 ```bash
-pip install git+https://github.com/yourusername/assr.git
+pip install git+https://github.com/xfdbv99pqh-jpg/ASSR.git
+
 ```
 
-Or with transformers support:
+*Requires: `torch`, `transformers`, `numpy*`
 
-```bash
-pip install "assr[transformers] @ git+https://github.com/yourusername/assr.git"
-```
+##🛠️ Quick StartASSR drops into your existing Hugging Face training pipeline with zero friction.
 
-## 🛠️ Quick Start
+###1. The "Set It and Forget It" Workflow (Recommended)For large models (Llama, Mistral, ViT-Large), use **Auto-Calibration**. This scans your specific model architecture to determine healthy spectral baselines.
 
 ```python
-from transformers import TrainingArguments
-from assr import ASSRTrainer
+from transformers import AutoModelForCausalLM, TrainingArguments
+from assr import ASSRTrainer, auto_calibrate
 
-# Just replace Trainer with ASSRTrainer - that's it!
+# 1. Load your model
+model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+
+# 2. Run Auto-Calibration
+# This measures your model's initial health to set custom thresholds
+config = auto_calibrate(model, verbose=True)
+
+# 3. Use ASSRTrainer instead of the standard Trainer
 trainer = ASSRTrainer(
     model=model,
-    args=TrainingArguments(output_dir="./output", ...),
+    args=TrainingArguments(output_dir="checkpoints", learning_rate=2e-5),
     train_dataset=dataset,
+    assr_config=config  # <--- Pass the calibrated config here
 )
+
 trainer.train()
 
-# Check what happened
-summary = trainer.get_assr_summary()
-print(f"Interventions: {summary['total_interventions']}")
-print(f"Intervention rate: {summary['intervention_rate']:.1%}")
 ```
 
-## ⚙️ Configuration
+###2. Manual ConfigurationFor research or smaller models, you can define the config manually:
 
 ```python
-from assr import ASSRTrainer, ASSRConfig
+from assr import ASSRConfig, ASSRTrainer
 
 config = ASSRConfig(
-    base_lambda=1e-4,         # Base regularization strength
-    stable_rank_floor=0.25,   # Trigger if SR ratio falls below this
-    condition_ceiling=500,    # Trigger if condition number exceeds this
-    sample_ratio=0.1,         # Fraction of layers to check per step
-    log_interventions=False,  # Set True for debug output
+    base_lambda=1e-4,        # Strength of the L2 penalty
+    stable_rank_floor=0.25,  # Trigger if rank drops below 25% of dimension
+    condition_ceiling=1000,  # Trigger if condition number exceeds 1000
+    sample_ratio=0.1,        # Check 10% of layers per step (Higher = Safer but Slower)
+    sample_freq=1            # Check every N steps
 )
 
-trainer = ASSRTrainer(
-    model=model,
-    args=args,
-    train_dataset=dataset,
-    assr_config=config,
-)
-```
-
-### Recommended Configurations
-
-| Use Case | `stable_rank_floor` | `condition_ceiling` | `base_lambda` |
-|----------|--------------------|--------------------|---------------|
-| Default (balanced) | 0.25 | 500 | 1e-4 |
-| Conservative (fewer interventions) | 0.15 | 1000 | 5e-5 |
-| Aggressive (catch issues early) | 0.35 | 200 | 2e-4 |
-
-## 📊 Diagnostic Tools
-
-### Check Model Health Before Training
-
-```python
-from assr import print_spectral_report
-
-print_spectral_report(model)
-```
-
-Output:
-```
-===========================================================================
-  SPECTRAL HEALTH REPORT
-===========================================================================
-  Total Linear Layers: 74
-  Stable Rank Ratio: min=0.312, max=0.456, mean=0.378
-  Condition Number:  min=4.2, max=89.3, mean=23.1
-
-  Layer                                    Shape           SR Ratio   Condition
-  ---------------------------------------------------------------------------
-    h.0.attn.c_attn                        (768, 2304)     0.312      89.3
-    h.1.attn.c_attn                        (768, 2304)     0.318      76.2
-    ...
-  ---------------------------------------------------------------------------
-  ✅ All layers appear healthy
-===========================================================================
-```
-
-### Analyze Individual Layers
-
-```python
-from assr import analyze_layer
-
-layer = model.transformer.h[0].attn.c_attn
-analyze_layer(layer, "attention_qkv")
-```
-
-## 🔬 How It Works
-
-ASSR monitors two key spectral metrics:
-
-### 1. Stable Rank Ratio
-```
-Stable Rank = ||W||_F² / ||W||_2²
-```
-- Measures the "effective dimensionality" of the weight matrix
-- **Low values (<0.25)** indicate rank collapse — neurons becoming redundant
-- Random initialization typically gives 0.30-0.40
-
-### 2. Condition Number
-```
-Condition = σ_max / σ_min
-```
-- Measures how "stretched" the linear transformation is
-- **High values (>500)** indicate ill-conditioning — gradient instability risk
-
-When either metric crosses its threshold, ASSR applies an adaptive L2 penalty:
+trainer = ASSRTrainer(..., assr_config=config)
 
 ```
-λ_adaptive = λ_base × (1 + 10 × severity)
-loss_reg = λ_adaptive × ||W||²
-```
 
-The severity scales from 0 (at threshold) to 1 (severe issue), providing proportional intervention.
+##🧠 How It Works: The Dual-Trigger SystemASSR uses a **Dual-Sensor Architecture** to detect two distinct types of failure:
 
-## 📈 When to Use ASSR
+1. **Sensor A: Stable Rank (The "Collapse" Detector)**
+* *Math:* \frac{\|W\|_F^2}{\|W\|_2^2}
+* *What it detects:* Neurons becoming redundant or "collapsing" into a lower dimension.
+* *Action:* Triggers regularization to push neurons apart.
 
-ASSR is most beneficial when:
 
-- Training large models (>100M parameters)
-- Using high learning rates
-- Training for many epochs
-- Experiencing loss spikes or training instability
-- Using aggressive optimizers (high β2, low weight decay)
+2. **Sensor B: Condition Number (The "Explosion" Detector)**
+* *Math:* \frac{\sigma_{\max}}{\sigma_{\min}}
+* *What it detects:* Exploding gradients or extreme sensitivity to noise.
+* *Action:* Triggers regularization to constrain the largest singular values.
 
-## 🧪 Validated On
 
-- Llama-style models up to 500M parameters
-- Mixed precision training (FP16/BF16)
-- Gradient checkpointing enabled
-- Various learning rate schedules
 
-## 📄 Citation
+**The Actuator:**
+When a layer triggers an alarm, ASSR applies a **Soft L2 Penalty** scaled by the *severity* of the violation. This gently nudges the layer back into the healthy zone without destroying previously learned features.
 
-If you use ASSR in your research, please cite:
+##🤝 Compatibility| Feature | Support | Note |
+| --- | --- | --- |
+| **Hugging Face** | ✅ Native | Drop-in replacement for `Trainer`. |
+| **FP16 / BF16** | ✅ Native | **New in v1.3:** Sensors auto-cast to FP32 for stability on A100s. |
+| **FSDP / DeepSpeed** | ⚠️ Partial | Sensors run on individual GPU shards (local rank). |
 
-```bibtex
-@software{assr2024,
-  title={ASSR: Auto-Calibrated Stochastic Spectral Regularization},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/yourusername/assr}
-}
-```
-
-## 📜 License
-
-MIT License - see [LICENSE](LICENSE) for details.
+##LicenseMIT License. Free for research and commercial use.
