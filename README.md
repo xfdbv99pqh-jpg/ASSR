@@ -1,4 +1,4 @@
-Here is the updated `README.md`. I have rewritten it to be transparent about the **Speed vs. Stability** trade-off we just discussed, while highlighting the massive **A100/1.1B Parameter** validation success.
+
 
 ---
 
