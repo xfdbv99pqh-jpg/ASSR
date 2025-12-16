@@ -1,6 +1,6 @@
 # =============================================================================
 # ASSR: Auto-Calibrated Stochastic Spectral Regularization
-# Version: 1.2.0
+# Version: 1.3.0
 # =============================================================================
 #
 # Stabilizes LLM/ViT training by monitoring spectral health in real-time.
@@ -9,8 +9,9 @@
 #   pip install git+https://github.com/yourusername/assr.git
 #
 # Usage:
-#   from assr import ASSRTrainer, ASSRConfig
-#   trainer = ASSRTrainer(model=model, args=args, train_dataset=ds)
+#   from assr import ASSRTrainer, auto_calibrate
+#   config = auto_calibrate(model)  # Recommended for large models
+#   trainer = ASSRTrainer(model=model, args=args, train_dataset=ds, assr_config=config)
 #   trainer.train()
 #
 # =============================================================================
@@ -18,13 +19,15 @@
 import torch
 import torch.nn as nn
 import random
+import numpy as np
 from typing import List, Optional, Dict, Any, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __all__ = [
     "ASSRTrainer",
     "ASSRConfig",
+    "auto_calibrate",
     "compute_stable_rank",
     "compute_stable_rank_ratio",
     "compute_condition_number",
@@ -43,8 +46,8 @@ class ASSRConfig:
     """
     Configuration for ASSR regularization.
     
-    ASSR monitors two spectral health metrics and applies adaptive L2 
-    regularization when layers become unhealthy.
+    For large models (>200M params), use auto_calibrate() instead of defaults:
+        config = auto_calibrate(model)
     
     Attributes:
         base_lambda (float): Base regularization strength. Default: 1e-4
@@ -53,39 +56,19 @@ class ASSRConfig:
             falls below this threshold. Default: 0.25
             - Random Gaussian init typically gives 0.30-0.40
             - Values below 0.20 indicate significant collapse
-            - Lower values (0.15-0.20) for less aggressive intervention
             
         condition_ceiling (float): Trigger intervention if condition number 
             exceeds this threshold. Default: 500
-            - Well-conditioned matrices have condition < 100
-            - Values > 1000 indicate severe ill-conditioning
+            - Note: Large models often have condition > 1000 at init
+            - Use auto_calibrate() for large models
             
         sample_ratio (float): Fraction of layers to check per step. Default: 0.1
-            - Higher values = more thorough but slower
-            - 0.1 provides good coverage with minimal overhead
-            
+        
         sample_freq (int): Run ASSR check every N steps. Default: 1
-            - Set to 5-10 for faster training with slightly less coverage
-            
-        max_severity_multiplier (float): Maximum scaling factor for adaptive 
-            lambda. Default: 10.0
-            - Actual lambda ranges from base_lambda to base_lambda * (1 + this)
-            
-        log_interventions (bool): Print debug info when interventions occur. 
-            Default: False
-    
-    Example:
-        # Use defaults (recommended for most cases)
-        config = ASSRConfig()
         
-        # Less aggressive (fewer interventions)
-        config = ASSRConfig(stable_rank_floor=0.15, condition_ceiling=1000)
+        max_severity_multiplier (float): Maximum scaling for adaptive lambda. Default: 10.0
         
-        # More aggressive (catch issues earlier)
-        config = ASSRConfig(stable_rank_floor=0.30, condition_ceiling=200)
-        
-        # Debug mode
-        config = ASSRConfig(log_interventions=True)
+        log_interventions (bool): Print debug info. Default: False
     """
     
     base_lambda: float = 1e-4
@@ -116,25 +99,13 @@ def compute_stable_rank(W: torch.Tensor) -> float:
     
     Stable Rank = ||W||_F² / ||W||_2²
     
-    This measures the "effective number of dimensions" the matrix uses.
-    For a matrix with singular values σ₁ ≥ σ₂ ≥ ... ≥ σₙ:
-        - If all σᵢ are equal: stable_rank = n (full rank)
-        - If only σ₁ > 0: stable_rank = 1 (rank-1)
+    Measures the "effective number of dimensions" the matrix uses.
     
     Args:
         W: Weight tensor of shape (out_features, in_features)
         
     Returns:
         Stable rank as a float >= 1.0
-        
-    Example:
-        >>> W = torch.eye(100)
-        >>> compute_stable_rank(W)
-        100.0
-        
-        >>> W = torch.randn(100, 1) @ torch.randn(1, 100)  # rank-1
-        >>> compute_stable_rank(W)
-        1.0
     """
     if W.dim() != 2:
         return float(min(W.shape[-2:]) if W.dim() > 2 else W.numel())
@@ -154,26 +125,13 @@ def compute_stable_rank_ratio(W: torch.Tensor) -> float:
     """
     Compute stable rank as a fraction of maximum possible rank.
     
-    This normalizes stable rank to [0, 1] for easier threshold comparison.
+    Returns value in [0, 1]:
+    - 1.0 = using full rank capacity
+    - 0.0 = completely collapsed
     
-    Returns:
-        Value in [0, 1]:
-        - 1.0 = using full rank capacity (perfectly orthogonal)
-        - 0.0 = completely collapsed (rank-1)
-        
     Typical values:
-        - Random Gaussian init: 0.30-0.40
-        - Healthy trained layer: 0.25-0.50
-        - Concerning collapse: < 0.20
-        - Severe collapse: < 0.10
-        
-    Example:
-        >>> W = torch.eye(100)
-        >>> compute_stable_rank_ratio(W)
-        1.0
-        
-        >>> W = torch.randn(256, 128) * 0.02  # typical init
-        >>> compute_stable_rank_ratio(W)  # ~0.35
+    - Random Gaussian init: 0.30-0.40
+    - Healthy trained layer: 0.25-0.50
     """
     if W.dim() != 2:
         return 1.0
@@ -184,30 +142,14 @@ def compute_stable_rank_ratio(W: torch.Tensor) -> float:
 
 def compute_condition_number(W: torch.Tensor) -> float:
     """
-    Compute the Condition Number of a weight matrix.
-    
-    Condition Number = σ_max / σ_min
-    
-    This measures how "stretched" the linear transformation is.
-    High condition numbers lead to numerical instability and 
-    gradient explosion/vanishing.
+    Compute the Condition Number (σ_max / σ_min).
     
     Returns:
-        Condition number as a float:
-        - 1.0 = perfectly conditioned (orthogonal matrix)
-        - 1-10 = excellent conditioning
-        - 10-100 = good conditioning
-        - 100-1000 = moderate issues
-        - >1000 = severe ill-conditioning
-        - inf = rank deficient (σ_min ≈ 0)
-        
-    Example:
-        >>> W = torch.eye(100)
-        >>> compute_condition_number(W)
-        1.0
-        
-        >>> W, _ = torch.linalg.qr(torch.randn(100, 100))
-        >>> compute_condition_number(W)  # ~1.0
+        Condition number:
+        - 1-10: Excellent
+        - 10-100: Good
+        - 100-1000: Moderate issues
+        - >1000: Severe ill-conditioning
     """
     if W.dim() != 2:
         return 1.0
@@ -225,28 +167,7 @@ def compute_condition_number(W: torch.Tensor) -> float:
 
 
 def compute_spectral_health(W: torch.Tensor) -> Dict[str, Any]:
-    """
-    Compute comprehensive spectral health metrics for a weight matrix.
-    
-    Args:
-        W: Weight tensor
-        
-    Returns:
-        Dictionary containing:
-        - stable_rank: Raw stable rank value
-        - stable_rank_ratio: Normalized to [0, 1]
-        - effective_rank: Entropy-based effective rank
-        - condition: Condition number
-        - spectral_norm: Largest singular value
-        - min_singular_value: Smallest singular value
-        - frobenius_norm: Frobenius norm
-        - shape: Tuple of dimensions
-        
-    Example:
-        >>> W = torch.randn(256, 128)
-        >>> health = compute_spectral_health(W)
-        >>> print(f"SR ratio: {health['stable_rank_ratio']:.3f}")
-    """
+    """Compute comprehensive spectral health metrics."""
     if W.dim() != 2:
         return {
             'stable_rank': 1.0,
@@ -269,11 +190,10 @@ def compute_spectral_health(W: torch.Tensor) -> Dict[str, Any]:
             spectral_norm = s[0].item()
             min_sv = s[-1].item()
             
-            # Entropy-based effective rank
             s_norm = s / s.sum()
             s_norm = s_norm[s_norm > 1e-10]
             entropy = -torch.sum(s_norm * torch.log(s_norm)).item()
-            effective_rank = float(torch.exp(torch.tensor(entropy)))
+            effective_rank = float(np.exp(entropy))
         except Exception:
             spectral_norm = W.norm().item()
             min_sv = 0.0
@@ -292,6 +212,107 @@ def compute_spectral_health(W: torch.Tensor) -> Dict[str, Any]:
 
 
 # =============================================================================
+# AUTO-CALIBRATION
+# =============================================================================
+
+def auto_calibrate(
+    model: nn.Module,
+    percentile: float = 10.0,
+    margin_sr: float = 0.8,
+    margin_cond: float = 1.5,
+    base_lambda: float = 1e-5,
+    sample_ratio: float = 0.05,
+    sample_freq: int = 2,
+    verbose: bool = True,
+) -> ASSRConfig:
+    """
+    Auto-calibrate ASSR thresholds based on model's spectral distribution.
+    
+    Instead of fixed thresholds, this measures the model's actual spectral
+    health and sets thresholds to catch only the worst outliers. Recommended
+    for large models (>200M params) where default thresholds may be too aggressive.
+    
+    Args:
+        model: The model to analyze (before training starts)
+        percentile: Target the worst X% of layers. Default: 10
+        margin_sr: Multiply SR floor by this (lower = more lenient). Default: 0.8
+        margin_cond: Multiply condition ceiling by this (higher = more lenient). Default: 1.5
+        base_lambda: Base regularization strength. Default: 1e-5
+        sample_ratio: Fraction of layers to check per step. Default: 0.05
+        sample_freq: Check every N steps. Default: 2
+        verbose: Print calibration info. Default: True
+        
+    Returns:
+        ASSRConfig with calibrated thresholds
+        
+    Example:
+        >>> model = LlamaForCausalLM(config)
+        >>> assr_config = auto_calibrate(model)
+        >>> trainer = ASSRTrainer(model=model, assr_config=assr_config, ...)
+        
+    Note:
+        Call this BEFORE moving model to GPU to save memory, or the function
+        will work with the model wherever it currently resides.
+    """
+    sr_values = []
+    cond_values = []
+    
+    # Collect spectral metrics from all linear layers
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            sr = compute_stable_rank_ratio(m.weight)
+            cond = compute_condition_number(m.weight)
+            sr_values.append(sr)
+            if cond < float('inf'):
+                cond_values.append(cond)
+    
+    if not sr_values:
+        if verbose:
+            print("⚠️ No linear layers found, using defaults")
+        return ASSRConfig()
+    
+    sr_arr = np.array(sr_values)
+    cond_arr = np.array(cond_values) if cond_values else np.array([500.0])
+    
+    # Set thresholds at percentiles with margins
+    sr_floor = float(np.percentile(sr_arr, percentile) * margin_sr)
+    cond_ceiling = float(np.percentile(cond_arr, 100 - percentile) * margin_cond)
+    
+    # Ensure reasonable bounds
+    sr_floor = max(0.05, min(sr_floor, 0.4))  # Clamp to [0.05, 0.4]
+    cond_ceiling = max(100, cond_ceiling)      # At least 100
+    
+    # Count expected triggers
+    n_sr_trigger = int(np.sum(sr_arr < sr_floor))
+    n_cond_trigger = int(np.sum(cond_arr > cond_ceiling))
+    
+    if verbose:
+        print(f"\n🔬 ASSR Auto-Calibration")
+        print(f"   ─────────────────────────────────────────")
+        print(f"   Linear layers analyzed: {len(sr_values)}")
+        print(f"   Stable Rank Ratio: min={sr_arr.min():.3f}, "
+              f"median={np.median(sr_arr):.3f}, max={sr_arr.max():.3f}")
+        print(f"   Condition Number:  min={cond_arr.min():.0f}, "
+              f"median={np.median(cond_arr):.0f}, max={cond_arr.max():.0f}")
+        print(f"   ─────────────────────────────────────────")
+        print(f"   Calibrated thresholds (targeting {percentile}% outliers):")
+        print(f"   → stable_rank_floor  = {sr_floor:.3f}")
+        print(f"   → condition_ceiling  = {cond_ceiling:.0f}")
+        print(f"   Expected triggers at init: {n_sr_trigger} rank, {n_cond_trigger} condition")
+        print(f"   ─────────────────────────────────────────\n")
+    
+    return ASSRConfig(
+        base_lambda=base_lambda,
+        stable_rank_floor=sr_floor,
+        condition_ceiling=cond_ceiling,
+        sample_ratio=sample_ratio,
+        sample_freq=sample_freq,
+        max_severity_multiplier=10.0,
+        log_interventions=False,
+    )
+
+
+# =============================================================================
 # ASSR TRAINER
 # =============================================================================
 
@@ -302,65 +323,34 @@ try:
         """
         Hugging Face Trainer with Auto-Calibrated Stochastic Spectral Regularization.
         
-        ASSR monitors layer health during training and applies adaptive L2 
-        regularization when spectral instabilities are detected. It targets
-        two failure modes:
+        Monitors layer health during training and applies adaptive L2 
+        regularization when spectral instabilities are detected.
         
-        1. **Rank Collapse** (low stable rank): Neurons becoming redundant,
-           reducing the effective capacity of the layer.
-           
-        2. **Ill-Conditioning** (high condition number): Singular values
-           becoming too spread out, causing gradient instability.
-        
-        The regularization strength is automatically calibrated based on the
-        severity of the detected issue.
-        
-        Args:
-            assr_config: ASSRConfig object. If None, uses default configuration.
-            *args, **kwargs: Passed to the parent Trainer class.
-            
-        Attributes:
-            assr_rank_interventions: Count of rank-based interventions
-            assr_condition_interventions: Count of condition-based interventions
-            assr_total_reg_loss: Cumulative regularization loss
-            assr_steps_with_intervention: Steps where at least one intervention occurred
-            
-        Example:
+        Example (small models, <200M params):
             ```python
-            from assr import ASSRTrainer, ASSRConfig
-            from transformers import TrainingArguments
+            from assr import ASSRTrainer
             
-            # Basic usage with defaults
             trainer = ASSRTrainer(
                 model=model,
-                args=TrainingArguments(output_dir="./out", ...),
+                args=training_args,
                 train_dataset=dataset,
             )
             trainer.train()
+            ```
             
-            # Check what happened
-            summary = trainer.get_assr_summary()
-            print(f"Interventions: {summary['total_interventions']}")
+        Example (large models, recommended):
+            ```python
+            from assr import ASSRTrainer, auto_calibrate
             
-            # Custom configuration
-            config = ASSRConfig(
-                base_lambda=5e-5,        # Lighter regularization
-                stable_rank_floor=0.20,  # More permissive
-                log_interventions=True,  # Debug output
-            )
+            config = auto_calibrate(model)  # Measure model first
             trainer = ASSRTrainer(
                 model=model,
-                args=args,
+                args=training_args,
                 train_dataset=dataset,
                 assr_config=config,
             )
+            trainer.train()
             ```
-            
-        Note:
-            ASSR adds minimal overhead (<0.1% typically) due to:
-            - Stochastic sampling (only 10% of layers checked per step)
-            - Efficient SVD computation for health metrics
-            - No gradient computation for the sensing phase
         """
         
         def __init__(
@@ -396,12 +386,7 @@ try:
             return_outputs: bool = False,
             **kwargs
         ):
-            """
-            Compute training loss with ASSR regularization.
-            
-            This method overrides the parent Trainer.compute_loss() to add
-            spectral regularization before the backward pass.
-            """
+            """Compute training loss with ASSR regularization."""
             # Forward pass
             outputs = model(**inputs)
             main_loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
@@ -425,12 +410,7 @@ try:
             device: torch.device,
             dtype: torch.dtype
         ) -> torch.Tensor:
-            """
-            Compute the ASSR regularization term.
-            
-            Uses stochastic sampling to check a subset of layers, then applies
-            adaptive L2 penalty to layers that fail spectral health checks.
-            """
+            """Compute the ASSR regularization term."""
             cfg = self.assr_config
             reg_loss = torch.tensor(0.0, device=device, dtype=dtype)
             
@@ -458,13 +438,11 @@ try:
                     
                     # Compute severity in [0, 1]
                     if is_rank_low:
-                        # How far below the floor?
                         severity = (cfg.stable_rank_floor - sr_ratio) / cfg.stable_rank_floor
                         severity = min(max(severity, 0.0), 1.0)
                         self.assr_rank_interventions += 1
                         trigger_type = "Rank"
                     else:
-                        # How far above the ceiling?
                         excess = condition / cfg.condition_ceiling
                         severity = min((excess - 1.0) / 10.0, 1.0)
                         self.assr_condition_interventions += 1
@@ -494,26 +472,7 @@ try:
             return reg_loss
         
         def get_assr_summary(self) -> Dict[str, Any]:
-            """
-            Get summary statistics of ASSR activity during training.
-            
-            Returns:
-                Dictionary containing:
-                - rank_interventions: Number of rank-triggered interventions
-                - condition_interventions: Number of condition-triggered interventions
-                - total_interventions: Sum of both types
-                - steps_with_intervention: Number of steps with any intervention
-                - intervention_rate: Fraction of steps with intervention
-                - total_reg_loss: Cumulative regularization loss
-                - avg_reg_loss_per_step: Average regularization per step
-                - num_linear_layers: Total linear layers in model
-                - config: The ASSRConfig used
-                
-            Example:
-                >>> trainer.train()
-                >>> summary = trainer.get_assr_summary()
-                >>> print(f"Intervention rate: {summary['intervention_rate']:.1%}")
-            """
+            """Get summary statistics of ASSR activity during training."""
             total_steps = self.state.global_step if self.state else 0
             return {
                 'rank_interventions': self.assr_rank_interventions,
@@ -541,9 +500,8 @@ try:
             self.assr_steps_with_intervention = 0
 
 except ImportError:
-    # transformers not installed - ASSRTrainer not available
     ASSRTrainer = None
-    
+
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -553,30 +511,9 @@ def print_spectral_report(model: nn.Module, top_k: int = 10) -> None:
     """
     Print a spectral health report for all linear layers in a model.
     
-    Analyzes each linear layer and reports stable rank ratio and condition
-    number, highlighting layers that may have issues.
-    
     Args:
         model: PyTorch model to analyze
         top_k: Number of worst layers to show in detail
-        
-    Example:
-        >>> from transformers import AutoModel
-        >>> model = AutoModel.from_pretrained("gpt2")
-        >>> print_spectral_report(model)
-        
-        ===========================================================================
-          SPECTRAL HEALTH REPORT
-        ===========================================================================
-          Total Linear Layers: 74
-          Stable Rank Ratio: min=0.312, max=0.456, mean=0.378
-          Condition Number:  min=4.2, max=89.3, mean=23.1
-          
-          Layer                                    Shape           SR Ratio   Condition
-          ---------------------------------------------------------------------------
-            h.0.attn.c_attn                        (768, 2304)     0.312      89.3
-            ...
-        ===========================================================================
     """
     results = []
     for name, m in model.named_modules():
@@ -594,7 +531,6 @@ def print_spectral_report(model: nn.Module, top_k: int = 10) -> None:
         print("=" * 75 + "\n")
         return
     
-    # Statistics
     sr_vals = [r['stable_rank_ratio'] for r in results]
     c_vals = [r['condition'] for r in results if r['condition'] < float('inf')]
     
@@ -604,7 +540,6 @@ def print_spectral_report(model: nn.Module, top_k: int = 10) -> None:
         print(f"  Condition Number:  min={min(c_vals):.1f}, max={max(c_vals):.1f}, "
               f"mean={sum(c_vals)/len(c_vals):.1f}")
     
-    # Sort by stable rank ratio (lowest = most concerning)
     results.sort(key=lambda x: x['stable_rank_ratio'])
     
     print(f"\n  {'Layer':<40} {'Shape':<15} {'SR Ratio':<10} {'Condition':<12}")
@@ -614,7 +549,6 @@ def print_spectral_report(model: nn.Module, top_k: int = 10) -> None:
         sr_flag = "⚠️" if r['stable_rank_ratio'] < 0.25 else "  "
         c_flag = "⚠️" if r['condition'] > 500 else "  "
         
-        # Truncate long names
         name = r['name']
         if len(name) > 38:
             name = "..." + name[-35:]
@@ -628,47 +562,24 @@ def print_spectral_report(model: nn.Module, top_k: int = 10) -> None:
     if len(results) > top_k:
         print(f"  ... and {len(results) - top_k} more layers")
     
-    # Health assessment summary
     n_rank_issues = sum(1 for r in results if r['stable_rank_ratio'] < 0.25)
     n_cond_issues = sum(1 for r in results if r['condition'] > 500)
     
     print("\n  " + "-" * 73)
     if n_rank_issues == 0 and n_cond_issues == 0:
-        print("  ✅ All layers appear healthy")
+        print("  ✅ All layers appear healthy (using default thresholds)")
     else:
         if n_rank_issues > 0:
-            print(f"  ⚠️  {n_rank_issues} layer(s) have low stable rank (potential collapse)")
+            print(f"  ⚠️  {n_rank_issues} layer(s) have low stable rank")
         if n_cond_issues > 0:
             print(f"  ⚠️  {n_cond_issues} layer(s) are ill-conditioned")
+        print("  💡 Tip: Use auto_calibrate(model) for large models")
     
     print("=" * 75 + "\n")
 
 
 def analyze_layer(layer: nn.Linear, name: str = "layer") -> Dict[str, Any]:
-    """
-    Perform detailed spectral analysis of a single layer.
-    
-    Args:
-        layer: A nn.Linear module to analyze
-        name: Name to display in output
-        
-    Returns:
-        Dictionary of spectral health metrics
-        
-    Example:
-        >>> layer = model.transformer.h[0].attn.c_attn
-        >>> health = analyze_layer(layer, "attention_qkv")
-        
-        Analysis of 'attention_qkv':
-          Shape: (768, 2304)
-          Stable Rank: 245.32 (ratio: 0.319)
-          Effective Rank: 289.45
-          Condition Number: 89.3
-          Spectral Norm: 1.2345
-          Min Singular Value: 0.0138
-          Frobenius Norm: 12.456
-          ✅ Layer appears healthy
-    """
+    """Perform detailed spectral analysis of a single layer."""
     health = compute_spectral_health(layer.weight)
     
     print(f"\n  Analysis of '{name}':")
@@ -681,12 +592,11 @@ def analyze_layer(layer: nn.Linear, name: str = "layer") -> Dict[str, Any]:
     print(f"    Min Singular Value: {health['min_singular_value']:.6f}")
     print(f"    Frobenius Norm: {health['frobenius_norm']:.4f}")
     
-    # Assessment
     issues = []
     if health['stable_rank_ratio'] < 0.25:
-        issues.append("Low stable rank (potential collapse)")
+        issues.append("Low stable rank")
     if health['condition'] > 500:
-        issues.append("High condition number (ill-conditioned)")
+        issues.append("High condition number")
     
     if issues:
         print(f"    ⚠️  Issues: {', '.join(issues)}")
