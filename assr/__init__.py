@@ -15,7 +15,8 @@ from .core import (
     # Main interface
     ASSRTrainer,
     ASSRConfig,
-    
+    auto_calibrate,
+
     # Spectral metrics
     compute_stable_rank,
     compute_stable_rank_ratio,
@@ -33,6 +34,7 @@ from .core import (
 __all__ = [
     "ASSRTrainer",
     "ASSRConfig",
+    "auto_calibrate",
     "compute_stable_rank",
     "compute_stable_rank_ratio", 
     "compute_condition_number",
