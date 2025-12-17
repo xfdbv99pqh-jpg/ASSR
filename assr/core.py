@@ -1,15 +1,11 @@
 # =============================================================================
 # ASSR: Auto-Calibrated Stochastic Spectral Regularization
-# Version: 1.4.0
+# Version: 1.5.0
 # =============================================================================
 #
-# New in v1.4: Biopsy Mode - subsample large weight matrices for faster
-# spectral computation on billion-parameter models.
-#
-# Usage:
-#   from assr import ASSRTrainer, auto_calibrate
-#   config = auto_calibrate(model)
-#   trainer = ASSRTrainer(model=model, args=args, assr_config=config, ...)
+# v1.5: True auto-configuration - detects model size and adjusts ALL parameters:
+#   - Thresholds (stable_rank_floor, condition_ceiling)
+#   - Speed (sample_ratio, sample_freq, subsample_limit)
 #
 # =============================================================================
 
@@ -18,9 +14,9 @@ import torch.nn as nn
 import random
 import numpy as np
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 __all__ = [
     "ASSRTrainer",
     "ASSRConfig",
@@ -43,18 +39,8 @@ class ASSRConfig:
     """
     Configuration for ASSR regularization.
     
-    Attributes:
-        base_lambda: Base regularization strength. Default: 1e-4
-        stable_rank_floor: Trigger if SR ratio below this. Default: 0.25
-        condition_ceiling: Trigger if condition above this. Default: 500
-        sample_ratio: Fraction of layers to check per step. Default: 0.1
-        sample_freq: Check every N steps. Default: 1
-        max_severity_multiplier: Max scaling for adaptive lambda. Default: 10.0
-        subsample_limit: Max matrix dimension for SVD (Biopsy Mode). Default: 1024
-            - Matrices larger than this are randomly subsampled
-            - Set to None to disable (full SVD always)
-            - Lower values = faster but less accurate
-        log_interventions: Print debug info. Default: False
+    For best results, use auto_calibrate(model) which sets ALL parameters
+    based on model size automatically.
     """
     
     base_lambda: float = 1e-4
@@ -63,7 +49,7 @@ class ASSRConfig:
     sample_ratio: float = 0.1
     sample_freq: int = 1
     max_severity_multiplier: float = 10.0
-    subsample_limit: Optional[int] = 1024  # Biopsy Mode: subsample large matrices
+    subsample_limit: Optional[int] = 1024
     log_interventions: bool = False
     
     def __post_init__(self):
@@ -81,32 +67,16 @@ class ASSRConfig:
 # =============================================================================
 
 def _subsample_matrix(W: torch.Tensor, limit: int) -> torch.Tensor:
-    """
-    Subsample a large matrix for faster spectral computation.
-    
-    For a matrix larger than limit x limit, randomly select rows and columns
-    to create a smaller representative sample. The spectral properties of
-    the subsample approximate those of the full matrix.
-    
-    Args:
-        W: Weight matrix of shape (m, n)
-        limit: Maximum dimension size
-        
-    Returns:
-        Subsampled matrix of shape (min(m, limit), min(n, limit))
-    """
+    """Subsample large matrix for faster SVD."""
     m, n = W.shape
     
     if m <= limit and n <= limit:
         return W
     
     with torch.no_grad():
-        # Random row indices
         if m > limit:
             row_idx = torch.randperm(m, device=W.device)[:limit]
             W = W[row_idx, :]
-        
-        # Random column indices
         if n > limit:
             col_idx = torch.randperm(n, device=W.device)[:limit]
             W = W[:, col_idx]
@@ -115,33 +85,19 @@ def _subsample_matrix(W: torch.Tensor, limit: int) -> torch.Tensor:
 
 
 # =============================================================================
-# SPECTRAL SENSORS (with Biopsy Mode support)
+# SPECTRAL SENSORS
 # =============================================================================
 
 def compute_stable_rank(W: torch.Tensor, subsample_limit: Optional[int] = None) -> float:
-    """
-    Compute the Stable Rank of a weight matrix.
-    
-    Stable Rank = ||W||_F² / ||W||_2²
-    
-    Args:
-        W: Weight tensor
-        subsample_limit: If set, subsample matrices larger than this (Biopsy Mode)
-        
-    Returns:
-        Stable rank as a float >= 1.0
-    """
+    """Compute Stable Rank = ||W||_F² / ||W||_2²"""
     if W.dim() != 2:
         return float(min(W.shape[-2:]) if W.dim() > 2 else W.numel())
     
     with torch.no_grad():
         try:
-            # Biopsy Mode: subsample large matrices
             W_sample = W if subsample_limit is None else _subsample_matrix(W, subsample_limit)
-            
             frob_sq = torch.sum(W_sample ** 2).item()
             spectral_sq = torch.linalg.svdvals(W_sample)[0].item() ** 2
-            
             if spectral_sq > 1e-10:
                 return max(1.0, frob_sq / spectral_sq)
             return 1.0
@@ -150,20 +106,10 @@ def compute_stable_rank(W: torch.Tensor, subsample_limit: Optional[int] = None) 
 
 
 def compute_stable_rank_ratio(W: torch.Tensor, subsample_limit: Optional[int] = None) -> float:
-    """
-    Compute stable rank as a fraction of maximum possible rank.
-    
-    Args:
-        W: Weight tensor
-        subsample_limit: If set, subsample matrices larger than this
-        
-    Returns:
-        Value in [0, 1]
-    """
+    """Compute stable rank as fraction of max possible rank [0, 1]."""
     if W.dim() != 2:
         return 1.0
     
-    # Use subsampled dimensions for ratio calculation
     if subsample_limit is not None:
         effective_shape = (min(W.shape[0], subsample_limit), min(W.shape[1], subsample_limit))
     else:
@@ -175,28 +121,16 @@ def compute_stable_rank_ratio(W: torch.Tensor, subsample_limit: Optional[int] = 
 
 
 def compute_condition_number(W: torch.Tensor, subsample_limit: Optional[int] = None) -> float:
-    """
-    Compute the Condition Number (σ_max / σ_min).
-    
-    Args:
-        W: Weight tensor
-        subsample_limit: If set, subsample matrices larger than this
-        
-    Returns:
-        Condition number (1.0 for well-conditioned, inf for singular)
-    """
+    """Compute Condition Number = σ_max / σ_min."""
     if W.dim() != 2:
         return 1.0
     
     with torch.no_grad():
         try:
-            # Biopsy Mode: subsample large matrices
             W_sample = W if subsample_limit is None else _subsample_matrix(W, subsample_limit)
-            
             s = torch.linalg.svdvals(W_sample)
             s_max = s[0].item()
             s_min = s[-1].item()
-            
             if s_min > 1e-10:
                 return s_max / s_min
             return float('inf')
@@ -208,18 +142,12 @@ def compute_spectral_health(W: torch.Tensor, subsample_limit: Optional[int] = No
     """Compute comprehensive spectral health metrics."""
     if W.dim() != 2:
         return {
-            'stable_rank': 1.0,
-            'stable_rank_ratio': 1.0,
-            'effective_rank': 1.0,
-            'condition': 1.0,
-            'spectral_norm': W.norm().item(),
-            'min_singular_value': 0.0,
-            'frobenius_norm': W.norm().item(),
-            'shape': tuple(W.shape),
-            'subsampled': False,
+            'stable_rank': 1.0, 'stable_rank_ratio': 1.0, 'effective_rank': 1.0,
+            'condition': 1.0, 'spectral_norm': W.norm().item(),
+            'min_singular_value': 0.0, 'frobenius_norm': W.norm().item(),
+            'shape': tuple(W.shape), 'subsampled': False,
         }
     
-    # Check if we'll subsample
     subsampled = subsample_limit is not None and (W.shape[0] > subsample_limit or W.shape[1] > subsample_limit)
     
     stable_rank = compute_stable_rank(W, subsample_limit)
@@ -232,7 +160,6 @@ def compute_spectral_health(W: torch.Tensor, subsample_limit: Optional[int] = No
             s = torch.linalg.svdvals(W_sample)
             spectral_norm = s[0].item()
             min_sv = s[-1].item()
-            
             s_norm = s / s.sum()
             s_norm = s_norm[s_norm > 1e-10]
             entropy = -torch.sum(s_norm * torch.log(s_norm)).item()
@@ -243,105 +170,169 @@ def compute_spectral_health(W: torch.Tensor, subsample_limit: Optional[int] = No
             effective_rank = stable_rank
     
     return {
-        'stable_rank': stable_rank,
-        'stable_rank_ratio': stable_rank_ratio,
-        'effective_rank': effective_rank,
-        'condition': condition,
-        'spectral_norm': spectral_norm,
-        'min_singular_value': min_sv,
-        'frobenius_norm': W.norm().item(),
-        'shape': tuple(W.shape),
+        'stable_rank': stable_rank, 'stable_rank_ratio': stable_rank_ratio,
+        'effective_rank': effective_rank, 'condition': condition,
+        'spectral_norm': spectral_norm, 'min_singular_value': min_sv,
+        'frobenius_norm': W.norm().item(), 'shape': tuple(W.shape),
         'subsampled': subsampled,
     }
 
 
 # =============================================================================
-# AUTO-CALIBRATION
+# AUTO-CALIBRATION (Now truly auto-configures EVERYTHING)
 # =============================================================================
 
 def auto_calibrate(
     model: nn.Module,
     percentile: float = 10.0,
-    margin_sr: float = 0.8,
-    margin_cond: float = 1.5,
-    base_lambda: float = 1e-5,
-    sample_ratio: float = 0.05,
-    sample_freq: int = 2,
-    subsample_limit: int = 1024,
     verbose: bool = True,
 ) -> ASSRConfig:
     """
-    Auto-calibrate ASSR thresholds based on model's spectral distribution.
+    Auto-calibrate ALL ASSR parameters based on model size and spectral distribution.
     
-    Uses Biopsy Mode (subsampling) for fast calibration on large models.
+    This function automatically determines:
+    1. Thresholds (stable_rank_floor, condition_ceiling) - based on spectral stats
+    2. Speed parameters (sample_ratio, sample_freq, subsample_limit) - based on model size
     
     Args:
         model: The model to analyze
-        percentile: Target the worst X% of layers. Default: 10
-        margin_sr: Multiply SR floor by this. Default: 0.8
-        margin_cond: Multiply condition ceiling by this. Default: 1.5
-        base_lambda: Base regularization strength. Default: 1e-5
-        sample_ratio: Fraction of layers to check per step. Default: 0.05
-        sample_freq: Check every N steps. Default: 2
-        subsample_limit: Max matrix dim for SVD (Biopsy Mode). Default: 1024
+        percentile: Target the worst X% of layers for thresholds. Default: 10
         verbose: Print calibration info. Default: True
         
     Returns:
-        ASSRConfig with calibrated thresholds
+        Fully configured ASSRConfig
         
     Example:
         >>> model = AutoModelForCausalLM.from_pretrained("TinyLlama/...")
-        >>> config = auto_calibrate(model)
+        >>> config = auto_calibrate(model)  # That's it! Everything is configured.
         >>> trainer = ASSRTrainer(model=model, assr_config=config, ...)
     """
-    sr_values = []
-    cond_values = []
-    n_subsampled = 0
     
-    for name, m in model.named_modules():
-        if isinstance(m, nn.Linear):
-            W = m.weight
-            sr = compute_stable_rank_ratio(W, subsample_limit)
-            cond = compute_condition_number(W, subsample_limit)
-            sr_values.append(sr)
-            if cond < float('inf'):
-                cond_values.append(cond)
-            
-            # Count subsampled layers
-            if W.shape[0] > subsample_limit or W.shape[1] > subsample_limit:
-                n_subsampled += 1
+    # =========================================================================
+    # STEP 1: Analyze model size
+    # =========================================================================
     
-    if not sr_values:
+    linear_layers = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    num_layers = len(linear_layers)
+    
+    if num_layers == 0:
         if verbose:
             print("⚠️ No linear layers found, using defaults")
         return ASSRConfig()
     
+    # Count parameters and find max layer size
+    total_params = sum(p.numel() for p in model.parameters())
+    max_dim = max(max(m.weight.shape) for _, m in linear_layers)
+    
+    # =========================================================================
+    # STEP 2: Determine speed parameters based on model size
+    # =========================================================================
+    
+    # Model size tiers:
+    # - Small (<100M): Full speed, check frequently
+    # - Medium (100M-500M): Moderate sampling
+    # - Large (500M-2B): Light sampling, less frequent
+    # - XL (>2B): Minimal sampling, very infrequent
+    
+    if total_params < 100_000_000:  # <100M
+        sample_ratio = 0.10   # 10% of layers
+        sample_freq = 1       # Every step
+        subsample_limit = 1024
+        base_lambda = 1e-4
+        tier = "Small (<100M)"
+        
+    elif total_params < 500_000_000:  # 100M-500M
+        sample_ratio = 0.05   # 5% of layers
+        sample_freq = 2       # Every 2 steps
+        subsample_limit = 768
+        base_lambda = 5e-5
+        tier = "Medium (100M-500M)"
+        
+    elif total_params < 2_000_000_000:  # 500M-2B
+        sample_ratio = 0.02   # 2% of layers
+        sample_freq = 5       # Every 5 steps
+        subsample_limit = 512
+        base_lambda = 2e-5
+        tier = "Large (500M-2B)"
+        
+    else:  # >2B
+        sample_ratio = 0.01   # 1% of layers
+        sample_freq = 10      # Every 10 steps
+        subsample_limit = 384
+        base_lambda = 1e-5
+        tier = "XL (>2B)"
+    
+    # Ensure we check at least 1 layer
+    layers_per_check = max(1, int(num_layers * sample_ratio))
+    
+    # =========================================================================
+    # STEP 3: Collect spectral statistics (using biopsy mode for speed)
+    # =========================================================================
+    
+    sr_values = []
+    cond_values = []
+    n_subsampled = 0
+    
+    # Only sample subset for large models during calibration too
+    if num_layers > 50:
+        calibration_layers = random.sample(linear_layers, min(50, num_layers))
+    else:
+        calibration_layers = linear_layers
+    
+    for name, m in calibration_layers:
+        W = m.weight
+        sr = compute_stable_rank_ratio(W, subsample_limit)
+        cond = compute_condition_number(W, subsample_limit)
+        sr_values.append(sr)
+        if cond < float('inf'):
+            cond_values.append(cond)
+        if W.shape[0] > subsample_limit or W.shape[1] > subsample_limit:
+            n_subsampled += 1
+    
     sr_arr = np.array(sr_values)
     cond_arr = np.array(cond_values) if cond_values else np.array([500.0])
     
-    # Set thresholds at percentiles with margins
-    sr_floor = float(np.percentile(sr_arr, percentile) * margin_sr)
-    cond_ceiling = float(np.percentile(cond_arr, 100 - percentile) * margin_cond)
+    # =========================================================================
+    # STEP 4: Set thresholds at percentiles with margins
+    # =========================================================================
+    
+    sr_floor = float(np.percentile(sr_arr, percentile) * 0.8)
+    cond_ceiling = float(np.percentile(cond_arr, 100 - percentile) * 1.5)
     
     # Clamp to reasonable bounds
     sr_floor = max(0.05, min(sr_floor, 0.4))
     cond_ceiling = max(100, cond_ceiling)
     
+    # Expected triggers at init
     n_sr_trigger = int(np.sum(sr_arr < sr_floor))
     n_cond_trigger = int(np.sum(cond_arr > cond_ceiling))
     
+    # =========================================================================
+    # STEP 5: Report
+    # =========================================================================
+    
     if verbose:
-        print(f"\n🔬 ASSR Auto-Calibration {'(Biopsy Mode)' if n_subsampled > 0 else ''}")
-        print(f"   ─────────────────────────────────────────")
-        print(f"   Linear layers: {len(sr_values)} ({n_subsampled} subsampled)")
-        print(f"   Stable Rank Ratio: [{sr_arr.min():.3f}, {np.median(sr_arr):.3f}, {sr_arr.max():.3f}]")
-        print(f"   Condition Number:  [{cond_arr.min():.0f}, {np.median(cond_arr):.0f}, {cond_arr.max():.0f}]")
-        print(f"   ─────────────────────────────────────────")
+        print(f"\n🔬 ASSR Auto-Calibration v1.5")
+        print(f"   ─────────────────────────────────────────────────")
+        print(f"   Model tier: {tier}")
+        print(f"   Parameters: {total_params/1e6:.1f}M")
+        print(f"   Linear layers: {num_layers} (max dim: {max_dim})")
+        print(f"   ─────────────────────────────────────────────────")
+        print(f"   Speed Settings (auto-tuned for model size):")
+        print(f"   → sample_ratio     = {sample_ratio} ({layers_per_check} layers/check)")
+        print(f"   → sample_freq      = {sample_freq} (every {sample_freq} steps)")
+        print(f"   → subsample_limit  = {subsample_limit} (biopsy size)")
+        print(f"   → base_lambda      = {base_lambda}")
+        print(f"   ─────────────────────────────────────────────────")
+        print(f"   Threshold Settings (from spectral distribution):")
         print(f"   → stable_rank_floor  = {sr_floor:.3f}")
         print(f"   → condition_ceiling  = {cond_ceiling:.0f}")
-        print(f"   → subsample_limit    = {subsample_limit}")
-        print(f"   Expected init triggers: {n_sr_trigger} rank, {n_cond_trigger} condition")
-        print(f"   ─────────────────────────────────────────\n")
+        print(f"   ─────────────────────────────────────────────────")
+        print(f"   Spectral stats (sampled {len(calibration_layers)} layers):")
+        print(f"   SR ratio: [{sr_arr.min():.3f}, {np.median(sr_arr):.3f}, {sr_arr.max():.3f}]")
+        print(f"   Condition: [{cond_arr.min():.0f}, {np.median(cond_arr):.0f}, {cond_arr.max():.0f}]")
+        print(f"   Expected init triggers: {n_sr_trigger} rank, {n_cond_trigger} cond")
+        print(f"   ─────────────────────────────────────────────────\n")
     
     return ASSRConfig(
         base_lambda=base_lambda,
@@ -364,40 +355,19 @@ try:
     
     class ASSRTrainer(Trainer):
         """
-        Hugging Face Trainer with Auto-Calibrated Stochastic Spectral Regularization.
+        HuggingFace Trainer with Auto-Calibrated Stochastic Spectral Regularization.
         
-        v1.4 Features:
-        - Biopsy Mode: Subsample large matrices for 10x faster spectral computation
-        - Auto-calibration: Use auto_calibrate() for optimal thresholds
-        
-        Example:
-            ```python
-            from assr import ASSRTrainer, auto_calibrate
-            
-            config = auto_calibrate(model)
-            trainer = ASSRTrainer(
-                model=model,
-                args=training_args,
-                train_dataset=dataset,
-                assr_config=config,
-            )
+        Usage:
+            config = auto_calibrate(model)  # Auto-configures everything
+            trainer = ASSRTrainer(model=model, args=args, assr_config=config, ...)
             trainer.train()
-            
-            print(trainer.assr_stats)  # Quick stats access
-            ```
+            print(trainer.assr_stats)
         """
         
-        def __init__(
-            self,
-            assr_config: Optional[ASSRConfig] = None,
-            *args,
-            **kwargs
-        ):
+        def __init__(self, assr_config: Optional[ASSRConfig] = None, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.assr_config = assr_config or ASSRConfig()
             self._linear_layers: Optional[List[nn.Module]] = None
-            
-            # Statistics
             self._assr_rank_interventions: int = 0
             self._assr_condition_interventions: int = 0
             self._assr_total_reg_loss: float = 0.0
@@ -405,17 +375,13 @@ try:
         
         @property
         def linear_layers(self) -> List[nn.Module]:
-            """Lazily cache linear layers."""
             if self._linear_layers is None:
-                self._linear_layers = [
-                    m for m in self.model.modules()
-                    if isinstance(m, nn.Linear)
-                ]
+                self._linear_layers = [m for m in self.model.modules() if isinstance(m, nn.Linear)]
             return self._linear_layers
         
         @property
         def assr_stats(self) -> Dict[str, Any]:
-            """Quick access to ASSR statistics (alias for get_assr_summary)."""
+            """Quick stats access."""
             return {
                 'rank_int': self._assr_rank_interventions,
                 'cond_int': self._assr_condition_interventions,
@@ -424,14 +390,7 @@ try:
                 'steps_with_int': self._assr_steps_with_intervention,
             }
         
-        def compute_loss(
-            self,
-            model: nn.Module,
-            inputs: Dict[str, torch.Tensor],
-            return_outputs: bool = False,
-            **kwargs
-        ):
-            """Compute training loss with ASSR regularization."""
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             outputs = model(**inputs)
             main_loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
             
@@ -439,20 +398,11 @@ try:
             if step % self.assr_config.sample_freq != 0:
                 return (main_loss, outputs) if return_outputs else main_loss
             
-            reg_loss = self._compute_assr_regularization(
-                main_loss.device,
-                main_loss.dtype
-            )
-            
+            reg_loss = self._compute_assr_regularization(main_loss.device, main_loss.dtype)
             total_loss = main_loss + reg_loss
             return (total_loss, outputs) if return_outputs else total_loss
         
-        def _compute_assr_regularization(
-            self,
-            device: torch.device,
-            dtype: torch.dtype
-        ) -> torch.Tensor:
-            """Compute ASSR regularization with Biopsy Mode support."""
+        def _compute_assr_regularization(self, device, dtype) -> torch.Tensor:
             cfg = self.assr_config
             reg_loss = torch.tensor(0.0, device=device, dtype=dtype)
             
@@ -464,8 +414,6 @@ try:
             
             for m in subset:
                 W = m.weight
-                
-                # Use Biopsy Mode if configured
                 limit = cfg.subsample_limit
                 
                 sr_ratio = compute_stable_rank_ratio(W, limit)
@@ -478,27 +426,18 @@ try:
                     step_had_intervention = True
                     
                     if is_rank_low:
-                        severity = (cfg.stable_rank_floor - sr_ratio) / cfg.stable_rank_floor
-                        severity = min(max(severity, 0.0), 1.0)
+                        severity = min(max((cfg.stable_rank_floor - sr_ratio) / cfg.stable_rank_floor, 0.0), 1.0)
                         self._assr_rank_interventions += 1
-                        trigger_type = "Rank"
                     else:
-                        excess = condition / cfg.condition_ceiling
-                        severity = min((excess - 1.0) / 10.0, 1.0)
+                        severity = min((condition / cfg.condition_ceiling - 1.0) / 10.0, 1.0)
                         self._assr_condition_interventions += 1
-                        trigger_type = "Cond"
                     
-                    adaptive_lambda = cfg.base_lambda * (
-                        1.0 + cfg.max_severity_multiplier * severity
-                    )
-                    
-                    # L2 penalty on FULL matrix (not subsampled)
+                    adaptive_lambda = cfg.base_lambda * (1.0 + cfg.max_severity_multiplier * severity)
                     penalty = torch.norm(W) ** 2
                     reg_loss = reg_loss + adaptive_lambda * penalty
                     
                     if cfg.log_interventions:
-                        print(f"  [ASSR] {trigger_type}: SR={sr_ratio:.3f}, "
-                              f"C={condition:.1f}, λ={adaptive_lambda:.2e}")
+                        print(f"  [ASSR] SR={sr_ratio:.3f}, C={condition:.1f}, λ={adaptive_lambda:.2e}")
             
             if step_had_intervention:
                 self._assr_steps_with_intervention += 1
@@ -507,28 +446,20 @@ try:
             return reg_loss
         
         def get_assr_summary(self) -> Dict[str, Any]:
-            """Get detailed ASSR statistics."""
             total_steps = self.state.global_step if self.state else 0
             return {
                 'rank_interventions': self._assr_rank_interventions,
                 'condition_interventions': self._assr_condition_interventions,
-                'total_interventions': (
-                    self._assr_rank_interventions + self._assr_condition_interventions
-                ),
+                'total_interventions': self._assr_rank_interventions + self._assr_condition_interventions,
                 'steps_with_intervention': self._assr_steps_with_intervention,
-                'intervention_rate': (
-                    self._assr_steps_with_intervention / max(total_steps, 1)
-                ),
+                'intervention_rate': self._assr_steps_with_intervention / max(total_steps, 1),
                 'total_reg_loss': self._assr_total_reg_loss,
-                'avg_reg_loss_per_step': (
-                    self._assr_total_reg_loss / max(total_steps, 1)
-                ),
+                'avg_reg_loss_per_step': self._assr_total_reg_loss / max(total_steps, 1),
                 'num_linear_layers': len(self.linear_layers),
                 'config': self.assr_config,
             }
         
         def reset_assr_stats(self) -> None:
-            """Reset ASSR statistics."""
             self._assr_rank_interventions = 0
             self._assr_condition_interventions = 0
             self._assr_total_reg_loss = 0.0
@@ -542,19 +473,8 @@ except ImportError:
 # UTILITIES
 # =============================================================================
 
-def print_spectral_report(
-    model: nn.Module, 
-    top_k: int = 10,
-    subsample_limit: Optional[int] = 1024
-) -> None:
-    """
-    Print spectral health report for all linear layers.
-    
-    Args:
-        model: PyTorch model to analyze
-        top_k: Number of worst layers to show
-        subsample_limit: Max matrix dim for SVD (Biopsy Mode). Default: 1024
-    """
+def print_spectral_report(model: nn.Module, top_k: int = 10, subsample_limit: Optional[int] = 1024) -> None:
+    """Print spectral health report."""
     results = []
     n_subsampled = 0
     
@@ -568,7 +488,7 @@ def print_spectral_report(
     print("\n" + "=" * 75)
     print(f"  SPECTRAL HEALTH REPORT {'(Biopsy Mode)' if n_subsampled > 0 else ''}")
     print("=" * 75)
-    print(f"  Total Linear Layers: {len(results)} ({n_subsampled} subsampled)")
+    print(f"  Linear Layers: {len(results)} ({n_subsampled} subsampled)")
     
     if not results:
         print("  No linear layers found.")
@@ -578,72 +498,30 @@ def print_spectral_report(
     sr_vals = [r['stable_rank_ratio'] for r in results]
     c_vals = [r['condition'] for r in results if r['condition'] < float('inf')]
     
-    print(f"  Stable Rank Ratio: min={min(sr_vals):.3f}, max={max(sr_vals):.3f}, "
-          f"mean={sum(sr_vals)/len(sr_vals):.3f}")
+    print(f"  SR Ratio: [{min(sr_vals):.3f}, {np.median(sr_vals):.3f}, {max(sr_vals):.3f}]")
     if c_vals:
-        print(f"  Condition Number:  min={min(c_vals):.1f}, max={max(c_vals):.1f}, "
-              f"mean={sum(c_vals)/len(c_vals):.1f}")
+        print(f"  Condition: [{min(c_vals):.0f}, {np.median(c_vals):.0f}, {max(c_vals):.0f}]")
     
     results.sort(key=lambda x: x['stable_rank_ratio'])
     
-    print(f"\n  {'Layer':<40} {'Shape':<15} {'SR Ratio':<10} {'Condition':<12}")
+    print(f"\n  {'Layer':<40} {'Shape':<15} {'SR':>8} {'Cond':>10}")
     print("  " + "-" * 73)
     
     for r in results[:top_k]:
         sr_flag = "⚠️" if r['stable_rank_ratio'] < 0.25 else "  "
         c_flag = "⚠️" if r['condition'] > 500 else "  "
-        
         name = r['name'][-38:] if len(r['name']) > 38 else r['name']
-        shape_str = f"{r['shape']}"
-        cond_str = f"{r['condition']:.1f}" if r['condition'] < 1e6 else "inf"
-        
-        print(f"  {sr_flag}{c_flag}{name:<38} {shape_str:<15} "
-              f"{r['stable_rank_ratio']:<10.3f} {cond_str:<12}")
+        cond_str = f"{r['condition']:.0f}" if r['condition'] < 1e6 else "inf"
+        print(f"  {sr_flag}{c_flag}{name:<38} {str(r['shape']):<15} {r['stable_rank_ratio']:>8.3f} {cond_str:>10}")
     
     if len(results) > top_k:
         print(f"  ... and {len(results) - top_k} more layers")
     
-    n_rank_issues = sum(1 for r in results if r['stable_rank_ratio'] < 0.25)
-    n_cond_issues = sum(1 for r in results if r['condition'] > 500)
-    
-    print("\n  " + "-" * 73)
-    if n_rank_issues == 0 and n_cond_issues == 0:
-        print("  ✅ All layers appear healthy")
-    else:
-        if n_rank_issues > 0:
-            print(f"  ⚠️  {n_rank_issues} layer(s) have low stable rank")
-        if n_cond_issues > 0:
-            print(f"  ⚠️  {n_cond_issues} layer(s) are ill-conditioned")
-        print("  💡 Tip: Use auto_calibrate(model) for large models")
-    
     print("=" * 75 + "\n")
 
 
-def analyze_layer(
-    layer: nn.Linear, 
-    name: str = "layer",
-    subsample_limit: Optional[int] = 1024
-) -> Dict[str, Any]:
-    """Detailed spectral analysis of a single layer."""
+def analyze_layer(layer: nn.Linear, name: str = "layer", subsample_limit: Optional[int] = 1024) -> Dict[str, Any]:
+    """Detailed analysis of a single layer."""
     health = compute_spectral_health(layer.weight, subsample_limit)
-    
-    print(f"\n  Analysis of '{name}':")
-    print(f"    Shape: {health['shape']} {'(subsampled)' if health['subsampled'] else ''}")
-    print(f"    Stable Rank: {health['stable_rank']:.2f} (ratio: {health['stable_rank_ratio']:.3f})")
-    print(f"    Effective Rank: {health['effective_rank']:.2f}")
-    print(f"    Condition Number: {health['condition']:.1f}")
-    print(f"    Spectral Norm: {health['spectral_norm']:.4f}")
-    print(f"    Frobenius Norm: {health['frobenius_norm']:.4f}")
-    
-    issues = []
-    if health['stable_rank_ratio'] < 0.25:
-        issues.append("Low stable rank")
-    if health['condition'] > 500:
-        issues.append("High condition number")
-    
-    if issues:
-        print(f"    ⚠️  Issues: {', '.join(issues)}")
-    else:
-        print(f"    ✅ Layer appears healthy")
-    
+    print(f"\n  '{name}': shape={health['shape']}, SR={health['stable_rank_ratio']:.3f}, Cond={health['condition']:.0f}")
     return health
